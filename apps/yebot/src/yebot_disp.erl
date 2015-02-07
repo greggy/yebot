@@ -82,6 +82,7 @@ init([]) ->
                      {stop, Reason :: term(), Reply :: term(), NewState :: #state{}} |
                      {stop, Reason :: term(), NewState :: #state{}}).
 handle_call(get_num, _From, #state{num=Num}=State) ->
+    lager:info("Get num from dispatcher on ~p port.", [self()]),
     Reply = {ok, Num},
     {reply, Reply, State#state{num = Num + 1}};
 handle_call(_Request, _From, State) ->

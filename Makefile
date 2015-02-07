@@ -1,2 +1,2 @@
 all:
-	(./rebar compile)
+	(./rebar get-deps compile)
