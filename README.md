@@ -1,0 +1,2 @@
+# yebot
+Jabber bot "Yebot"
