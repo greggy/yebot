@@ -26,5 +26,5 @@ init([]) ->
     Children = [
         ?CHILD(yebot_disp, worker)
     ],
-    {ok, { {one_for_one, 5, 10}, Children} }.
+    {ok, { {one_for_one, 5, 10}, []} }.
 
