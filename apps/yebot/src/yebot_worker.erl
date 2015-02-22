@@ -6,7 +6,7 @@
 %%% @end
 %%% Created : 07. фев 2015 16:34
 %%%-------------------------------------------------------------------
--module(yebot_disp).
+-module(yebot_worker).
 -author("greg").
 
 -behaviour(gen_server).
@@ -15,7 +15,7 @@
 -include_lib("exml/include/exml_stream.hrl").
 
 %% API
--export([start_link/0, get_num/0]).
+-export([start_link/1]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -29,18 +29,16 @@
 
 -record(state, {
 	  socket :: gen_tcp:socket(),
-	  server :: string(),
-	  room :: string(),
-	  name :: string(),
-	  pass :: string(),
+	  server :: binary(),
+	  room :: binary(),
+	  name :: binary(),
+	  pass :: binary(),
 	  xml_stream=undefined%% :: undefined | #xmlstream{}
 }).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
-get_num() ->
-    gen_server:call(?MODULE, get_num).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -48,10 +46,10 @@ get_num() ->
 %%
 %% @end
 %%--------------------------------------------------------------------
--spec(start_link() ->
+-spec(start_link(Room :: string()) ->
     {ok, Pid :: pid()} | ignore | {error, Reason :: term()}).
-start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+start_link(Room) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [Room], []).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -71,10 +69,11 @@ start_link() ->
 -spec(init(Args :: term()) ->
     {ok, State :: #state{}} | {ok, State :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term()} | ignore).
-init([]) ->
-    {ok, [Bot, Server, Pass]} = application:get_env(yebot, bot),
+init([Room]) ->
+    {ok, [Name, Server, Pass]} = application:get_env(yebot, bot),
     gen_server:cast(self(), connect),
-    {ok, #state{name = Bot, server = Server, pass = Pass}}.
+    {ok, #state{name = list_to_binary(Name), server = list_to_binary(Server),
+		pass = list_to_binary(Pass), room = list_to_binary(Room)}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -106,7 +105,7 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_cast(connect, #state{server=Server, name=Name}=State) ->
-    {ok, Socket} = gen_tcp:connect(Server, 5222, [binary, 
+    {ok, Socket} = gen_tcp:connect(binary_to_list(Server), 5222, [binary, 
 						  {active, true},
 						  {packet, 0},
 						  {reuseaddr, true}]),
@@ -125,12 +124,12 @@ handle_cast({new_stream, Data}, #state{socket=Socket}=State) ->
     ok = gen_tcp:send(Socket, Data),
     {noreply, State#state{xml_stream = undefined}};
 
-handle_cast({stop, Data}, #state{socket=Socket}=State) ->
-    Message0 = xml_packet(presence, <<"unavailable">>),
-    gen_server:cast(self(), {send, Message0}),
-    Message1 = xml_packet(close, stream),
-    gen_server:cast(self(), {send, Message1}),
-    {stop, State};
+%% handle_cast({stop, Data}, #state{socket=Socket}=State) ->
+%%     Message0 = xml_packet(presence, <<"unavailable">>),
+%%     gen_server:cast(self(), {send, Message0}),
+%%     Message1 = xml_packet(close, stream),
+%%     gen_server:cast(self(), {send, Message1}),
+%%     {stop, State};
 
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -211,7 +210,7 @@ code_change(_OldVsn, State, _Extra) ->
 %% Stream is started we need authenticated.
 parse_xml([#xmlel{name= <<"stream:features">>, children=[#xmlel{name= <<"starttls">>}|_]}],
 	  #state{name=Name, pass=Pass}=State) ->
-    lager:info("State ~p", [State]),
+    %% lager:info("State ~p", [State]),
     AuthPlain = xml_packet(auth, 'PLAIN', {Name, Pass}),
     gen_server:cast(self(), {send, AuthPlain});
 
@@ -226,9 +225,10 @@ parse_xml([#xmlel{name= <<"success">>}], #state{name=Name, server=Server}) ->
     %% lager:info("New stream ~p", [XmlPacket]),
     gen_server:cast(self(), {new_stream, XmlPacket});
 
-parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"type">>, <<"result">>}|_]}], #state{room=Room}) ->
+parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"type">>, <<"result">>}|_]}],
+	  #state{name = Name, server = Server, room = Room}) ->
     lager:info("New sessions started!!"),
-    XmlPacket = xml_packet(presence, Room),
+    XmlPacket = xml_packet(presence, {Name, Server, Room}),
     gen_server:cast(self(), {send, XmlPacket});
 
 parse_xml([#xmlel{name= <<"iq">>}], _) ->
@@ -238,7 +238,7 @@ parse_xml([#xmlel{name= <<"iq">>}], _) ->
 parse_xml([#xmlel{name= <<"message">>}=Data], #state{name=Name}=State) ->
     Body = exml_query:subelement(Data, <<"body">>),
     CData = exml_query:cdata(Body),
-    case binary:match(CData, list_to_binary(Name)) of
+    case binary:match(CData, Name) of
 	nomatch -> parse_xml(Data, State);
 	_ ->
 	    From = exml_query:attr(Data, <<"from">>),
@@ -252,8 +252,7 @@ parse_xml(Data, _) ->
 
 
 xml_packet(stream, {Name, Server}) ->
-    Data = io_lib:format("<stream:stream xmlns='jabber:client' from='~s' to='~s' version='1.0' xmlns:stream='http://etherx.jabber.org/streams' >", [string:join([Name, Server], "@"), Server]),
-    iolist_to_binary(Data);
+    <<"<stream:stream xmlns='jabber:client' from='", (<<Name/binary, "@", Server/binary>>)/binary, "' to='", Server/binary, "' version='1.0' xmlns:stream='http://etherx.jabber.org/streams' >">>;
 
 xml_packet(bind, Id) ->
     <<"<iq type='set' id='97460001'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>erlang</resource> </bind></iq>">>;
@@ -264,18 +263,18 @@ xml_packet(session, Id) ->
 xml_packet(presence, <<"unavailable">> =Status) ->
     <<"<presence xmlns='jabber:client' type='", Status/binary, "' />">>;
 
-xml_packet(presence, Room) ->
-    <<"<presence from='yebot@jabber.ru/erlang' id='97460003' to='.conf@conference.jabber.ru/yebot' />">>;
+xml_packet(presence, {Name, Server, Room}) ->
+    <<"<presence from='", Name/binary, "@", Server/binary, "/erlang' id='97460003' to='", Room/binary, "@conference.", Server/binary, "/", Name/binary, "'><x xmlns='http://jabber.org/protocol/muc' /></presence>">>;
 
 xml_packet(close, stream) ->
     <<"</stream:stream>">>;
 
 xml_packet(message, {Msg, To}) ->
-    <<"<message to='", To/binary, "' from='yebot@jabber.ru/erlang' type='groupchat'><body>", Msg/binary,"</body></message>">>.
+    <<"<message to='.conf@conference.jabber.ru' from='yebot@jabber.ru/erlang' type='groupchat'><body>", Msg/binary,"</body></message>">>.
 
 
 xml_packet(auth, 'PLAIN', {Name, Password}) ->
     lager:info("Name ~p, Password ~p", [Name, Password]),
-    %% BaseData = base64:encode(<<0, Name, 0, Password>>),
-    BaseData = <<"AHllYm90AEh1ZWJlcjEy">>,
+    BaseData = base64:encode(<<0, Name/binary, 0, Password/binary>>),
+    %% BaseData = <<"AHllYm90AEh1ZWJlcjEy">>,
     <<"<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>", BaseData/binary, "</auth>">>.
