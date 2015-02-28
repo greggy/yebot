@@ -77,7 +77,7 @@ start_link(Bot) ->
     {stop, Reason :: term()} | ignore).
 init([Bot]) ->
     lager:info("Start disp for bot ~p!!!", [Bot]),
-    %% gen_server:cast(self(), connect), %% Start dialog with server.
+    gen_server:cast(self(), connect), %% Start dialog with server.
     {ok, #state{name = Bot#config.name, 
 		server = Bot#config.server,
 		pass = Bot#config.pass,
@@ -237,17 +237,18 @@ parse_xml([#xmlel{name= <<"success">>}], #state{name=Name, server=Server}) ->
     %% lager:info("New stream ~p", [XmlPacket]),
     gen_server:cast(self(), {new_stream, XmlPacket});
 
-parse_xml(Data, _) ->
-    lager:info("RECV XML: ~n~p~n", [Data]).
-
-%% parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"type">>, <<"result">>}|_]}], #state{room=Room}) ->
-%%     lager:info("New sessions started!!"),
-%%     XmlPacket = xml_packet(presence, Room),
-%%     gen_server:cast(self(), {send, XmlPacket});
-
-%% parse_xml([#xmlel{name= <<"iq">>}], _) ->
-%%     XmlPacket = xml_packet(session, 123456576),
-%%     gen_server:cast(self(), {send, XmlPacket});
+%% Session is started, we start rooms' workers.
+parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"type">>, <<"result">>}|_]}]=Xml,
+	  #state{socket=Socket, name=Name, server=Server, rooms=Rooms}) ->
+    lager:info("New sessions started, we are starting rooms!!"),
+    [ begin
+	  Pid = yebot_worker_sup:start_worker(Socket, Name, Server, Room),
+	  Pid ! {get_data, Xml}
+      end || Room <- Rooms ];
+    
+parse_xml([#xmlel{name= <<"iq">>}], _) ->
+    XmlPacket = xml_packet(session, 123456576),
+    gen_server:cast(self(), {send, XmlPacket});
 
 %% parse_xml([#xmlel{name= <<"message">>}=Data], #state{name=Name}=State) ->
 %%     Body = exml_query:subelement(Data, <<"body">>),
@@ -260,10 +261,17 @@ parse_xml(Data, _) ->
 %% 	    gen_server:cast(self(), {send, XmlPacket})
 %%     end;
 
+parse_xml(Data, _) ->
+    lager:info("RECV XML: ~n~p~n", [Data]).
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Parse XML Packets
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 xml_packet(stream, {Name, Server}) ->
-    Data = io_lib:format("<stream:stream xmlns='jabber:client' from='~s' to='~s' version='1.0' xmlns:stream='http://etherx.jabber.org/streams' >", [string:join([Name, Server], "@"), Server]),
-    iolist_to_binary(Data);
+    JID = <<Name/binary, "@", Server/binary>>,
+    <<"<stream:stream xmlns='jabber:client' from='", JID/binary, "' to='", Server/binary, "' version='1.0' xmlns:stream='http://etherx.jabber.org/streams' >">>;
 
 xml_packet(bind, Id) ->
     <<"<iq type='set' id='97460001'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>erlang</resource> </bind></iq>">>;
@@ -271,17 +279,8 @@ xml_packet(bind, Id) ->
 xml_packet(session, Id) ->
     <<"<iq type='set' id='97460002'><session xmlns='urn:ietf:params:xml:ns:xmpp-session' /></iq>">>.
 
-%% xml_packet(presence, <<"unavailable">> =Status) ->
-%%     <<"<presence xmlns='jabber:client' type='", Status/binary, "' />">>;
-
-%% xml_packet(presence, Room) ->
-%%     <<"<presence from='yebot@jabber.ru/erlang' id='97460003' to='.conf@conference.jabber.ru/yebot' />">>;
-
 %% xml_packet(close, stream) ->
 %%     <<"</stream:stream>">>;
-
-%% xml_packet(message, {Msg, To}) ->
-%%     <<"<message to='", To/binary, "' from='yebot@jabber.ru/erlang' type='groupchat'><body>", Msg/binary,"</body></message>">>.
 
 
 xml_packet(auth, 'PLAIN', {Name, Password}) ->
