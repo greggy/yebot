@@ -23,8 +23,7 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    Children = [
-        ?CHILD(yebot_disp, worker)
-    ],
-    {ok, { {one_for_one, 5, 10}, []} }.
+    ConfigWorker = ?CHILD(yebot_config, worker),
+
+    {ok, { {one_for_one, 5, 10}, [ConfigWorker]} }.
 
