@@ -185,7 +185,7 @@ parse_xml([#xmlel{name= <<"message">>}=Data], #state{name=Name, socket=Socket}=S
     end;
 
 parse_xml(Data, _) ->
-    lager:info("RECV XML: ~n~p~n", [Data]).
+    lager:info("RECV XML IN WORKER: ~n~p~n", [Data]).
 
 
 xml_packet(presence, <<"unavailable">> =Status) ->

@@ -33,7 +33,8 @@
 	  server :: binary(),
 	  name :: binary(),
 	  pass :: binary(),
-	  rooms=[] :: list(binary()),
+	  config_rooms=[] :: list(binary()),
+	  rooms=[] :: list({binary(), pid()}),
 	  xml_stream=undefined%% :: undefined | #xmlstream{}
 }).
 
@@ -81,7 +82,7 @@ init([Bot]) ->
     {ok, #state{name = Bot#config.name, 
 		server = Bot#config.server,
 		pass = Bot#config.pass,
-		rooms = Bot#config.rooms}}.
+		config_rooms = Bot#config.rooms}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -124,6 +125,7 @@ handle_cast(connect, #state{server=Server, name=Name}=State) ->
     ok = gen_tcp:controlling_process(Socket, self()),
     Message = xml_packet(stream, {Name, Server}),
     gen_server:cast(self(), {send, Message}),
+    gen_server:cast(self(), start_rooms), %% Start rooms.
     {noreply, State#state{socket = Socket}};
 
 handle_cast({send, Data}, #state{socket=Socket}=State) ->
@@ -142,6 +144,15 @@ handle_cast({new_stream, Data}, #state{socket=Socket}=State) ->
 %%     Message1 = xml_packet(close, stream),
 %%     gen_server:cast(self(), {send, Message1}),
 %%     {stop, State};
+
+handle_cast(start_rooms, #state{socket=Socket, name=Name, server=Server, 
+				config_rooms=CRooms}=State) ->
+    Rooms =
+	[ begin
+	      Pid = yebot_worker_sup:start_worker(Socket, Name, Server, Room),
+	      {Room, Pid}
+	  end || Room <- CRooms ],
+    {noreply, State#state{rooms = Rooms}};
 
 handle_cast(_Request, State) ->
     {noreply, State}.
@@ -239,27 +250,25 @@ parse_xml([#xmlel{name= <<"success">>}], #state{name=Name, server=Server}) ->
 
 %% Session is started, we start rooms' workers.
 parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"type">>, <<"result">>}|_]}]=Xml,
-	  #state{socket=Socket, name=Name, server=Server, rooms=Rooms}) ->
-    lager:info("New sessions started, we are starting rooms!!"),
+	  #state{rooms=Rooms}) ->
+    lager:info("New sessions started, we are starting rooms ~p!!!", [Rooms]),
     [ begin
-	  Pid = yebot_worker_sup:start_worker(Socket, Name, Server, Room),
 	  Pid ! {get_data, Xml}
-      end || Room <- Rooms ];
+      end || {_Room, Pid} <- Rooms ];
     
 parse_xml([#xmlel{name= <<"iq">>}], _) ->
     XmlPacket = xml_packet(session, 123456576),
     gen_server:cast(self(), {send, XmlPacket});
 
-%% parse_xml([#xmlel{name= <<"message">>}=Data], #state{name=Name}=State) ->
-%%     Body = exml_query:subelement(Data, <<"body">>),
-%%     CData = exml_query:cdata(Body),
-%%     case binary:match(CData, list_to_binary(Name)) of
-%% 	nomatch -> parse_xml(Data, State);
-%% 	_ ->
-%% 	    From = exml_query:attr(Data, <<"from">>),
-%% 	    XmlPacket = xml_packet(message, {<<"pong">>, From}),
-%% 	    gen_server:cast(self(), {send, XmlPacket})
-%%     end;
+parse_xml([#xmlel{name= <<"message">>}=Data]=Xml, #state{rooms=Rooms}=_State) ->
+    From = exml_query:attr(Data, <<"from">>),
+    [Room|_] = binary:split(From, <<"@">>),
+    case proplists:get_value(Room, Rooms) of
+	undefined -> 
+	    lager:info("There isn't such started room ~p!!!", [Room]);
+	Pid ->
+	    Pid ! {get_data, Xml}
+    end;
 
 parse_xml(Data, _) ->
     lager:info("RECV XML: ~n~p~n", [Data]).
