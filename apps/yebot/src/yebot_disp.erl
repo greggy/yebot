@@ -16,7 +16,7 @@
 -include_lib("exml/include/exml_stream.hrl").
 
 %% API
--export([start_link/1, get_rooms/1]).
+-export([start_link/1, get_rooms/1, get_socket/1]).
 
 %% gen_server callbacks
 -export([init/1,
@@ -27,6 +27,8 @@
          code_change/3]).
 
 -define(SERVER, ?MODULE).
+-define(TIMER_DELAY, 10000).
+-define(TIMER_ERROR_DELAY, 20000).
 
 -record(state, {
 	  socket :: gen_tcp:socket(),
@@ -35,7 +37,9 @@
 	  pass :: binary(),
 	  config_rooms=[] :: list(binary()),
 	  rooms=[] :: list({binary(), pid()}),
-	  xml_stream=undefined%% :: undefined | #xmlstream{}
+	  xml_stream=undefined,
+	  id :: binary,
+	  tref=undefined :: timer:tref()
 }).
 
 %%%===================================================================
@@ -45,6 +49,10 @@
 -spec get_rooms(Disp :: atom()) -> list() | list(binary()).
 get_rooms(Disp) ->
     gen_server:call(Disp, get_rooms).
+
+
+get_socket(Disp) ->
+    gen_server:call(Disp, get_socket).
 
 %%--------------------------------------------------------------------
 %% @doc
@@ -102,6 +110,9 @@ init([Bot]) ->
 handle_call(get_rooms, _From, #state{rooms=Rooms}=State) ->
     {reply, {ok, Rooms}, State};
 
+handle_call(get_socket, _From, #state{socket=Socket}=State) ->
+    {reply, {ok, Socket}, State};
+
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
@@ -118,10 +129,11 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
 handle_cast(connect, #state{server=Server, name=Name}=State) ->
-    {ok, Socket} = gen_tcp:connect(binary_to_list(Server), 5222, [binary, 
-						  {active, true},
-						  {packet, 0},
-						  {reuseaddr, true}]),
+    {ok, Socket} = gen_tcp:connect(binary_to_list(Server), 5222, [binary,
+								  {keepalive, true},
+								  {active, true},
+								  {packet, 0},
+								  {reuseaddr, true}]),
     ok = gen_tcp:controlling_process(Socket, self()),
     Message = xml_packet(stream, {Name, Server}),
     gen_server:cast(self(), {send, Message}),
@@ -189,6 +201,14 @@ handle_info({tcp, _Socket, Data}, #state{xml_stream=Parser0}=State) ->
 handle_info({tcp_closed, _Socket}, State) ->
     {stop, tcp_closed, State};
 
+handle_info(connection_lost, State) ->
+    {stop, tcp_closed, State};
+
+handle_info({timer, XmlPacket}, State) ->
+    {ok, TRef} = timer:send_after(?TIMER_ERROR_DELAY, connection_lost),
+    gen_server:cast(self(), {send, XmlPacket}),
+    {noreply, State#state{tref = TRef}};
+
 handle_info(_Info, State) ->
     lager:info("Default handler ~p", [_Info]),
     {noreply, State}.
@@ -250,12 +270,23 @@ parse_xml([#xmlel{name= <<"success">>}], #state{name=Name, server=Server}) ->
 
 %% Session is started, we start rooms' workers.
 parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"type">>, <<"result">>}|_]}]=Xml,
-	  #state{rooms=Rooms}) ->
+	  #state{rooms=Rooms, name=Name, server=Server}) ->
     lager:info("New sessions started, we are starting rooms ~p!!!", [Rooms]),
+    %% Start ping scheduler
+    ping_scheduler(Name, Server),
     [ begin
 	  Pid ! {get_data, Xml}
       end || {_Room, Pid} <- Rooms ];
+
     
+parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"from">>, AServer}|_]}],
+	  #state{name = Name, server=Server, tref = TRef}) when AServer =:= Server ->
+    lager:info("We got ping from ~p server!!", [Server]),
+    %% First we cancel error TRef
+    {ok, cancel} = timer:cancel(TRef),
+    %% Start ping scheduler again
+    ping_scheduler(Name, Server);
+
 parse_xml([#xmlel{name= <<"iq">>}], _) ->
     XmlPacket = xml_packet(session, 123456576),
     gen_server:cast(self(), {send, XmlPacket});
@@ -278,6 +309,10 @@ parse_xml(Data, _) ->
 %% Parse XML Packets
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
+xml_packet(ping, {Name, Server}) ->
+    JID = <<Name/binary, "@", Server/binary, "/erlang">>,
+    <<"<iq from='", JID/binary, "' to='", Server/binary, "' id='c2s1' type='get'><ping xmlns='urn:xmpp:ping'/></iq>">>;
+
 xml_packet(stream, {Name, Server}) ->
     JID = <<Name/binary, "@", Server/binary>>,
     <<"<stream:stream xmlns='jabber:client' from='", JID/binary, "' to='", Server/binary, "' version='1.0' xmlns:stream='http://etherx.jabber.org/streams' >">>;
@@ -296,3 +331,8 @@ xml_packet(auth, 'PLAIN', {Name, Password}) ->
     lager:info("Name ~p, Password ~p", [Name, Password]),
     BaseData = base64:encode(<<0, Name/binary, 0, Password/binary>>),
     <<"<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>", BaseData/binary, "</auth>">>.
+
+
+ping_scheduler(Name, Server) ->
+    XmlPacket = xml_packet(ping, {Name, Server}),
+    timer:send_after(?TIMER_DELAY, {timer, XmlPacket}).
