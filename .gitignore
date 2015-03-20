@@ -10,3 +10,6 @@ rel/example_project
 .rebar
 .idea
 apps/*/ebin
+*~
+.edts
+log
