@@ -128,14 +128,14 @@ handle_call(_Request, _From, State) ->
     {noreply, NewState :: #state{}} |
     {noreply, NewState :: #state{}, timeout() | hibernate} |
     {stop, Reason :: term(), NewState :: #state{}}).
-handle_cast(connect, #state{server=Server, name=Name}=State) ->
+handle_cast(connect, #state{server=Server}=State) ->
     {ok, Socket} = gen_tcp:connect(binary_to_list(Server), 5222, [binary,
 								  {keepalive, true},
 								  {active, true},
 								  {packet, 0},
 								  {reuseaddr, true}]),
     ok = gen_tcp:controlling_process(Socket, self()),
-    Message = xml_packet(stream, {Name, Server}),
+    Message = xml_packet(stream, State),
     gen_server:cast(self(), {send, Message}),
     gen_server:cast(self(), start_rooms), %% Start rooms.
     {noreply, State#state{socket = Socket}};
@@ -188,7 +188,7 @@ handle_cast(_Request, State) ->
 handle_info({tcp, _Socket, Data}, #state{xml_stream=undefined}=State) ->
     {ok, Parser0} = exml_stream:new_parser(),
     {ok, Parser1, Xml} = exml_stream:parse(Parser0, Data),
-    %% lager:info("Xml ~p", [Xml]),
+    lager:info("NEW STREAM Xml ~p", [Xml]),
     parse_xml(Xml, State),
     {noreply, State#state{xml_stream = Parser1}};
 
@@ -251,44 +251,41 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 %% Stream is started we need authenticated.
-parse_xml([#xmlel{name= <<"stream:features">>, children=[#xmlel{name= <<"starttls">>}|_]}],
-	  #state{name=Name, pass=Pass}=State) ->
+parse_xml([#xmlel{name= <<"stream:features">>, children=[#xmlel{name= <<"starttls">>}|_]}], State) ->
     lager:info("State ~p", [State]),
-    AuthPlain = xml_packet(auth, 'PLAIN', {Name, Pass}),
+    AuthPlain = xml_packet(auth, 'PLAIN', State),
     gen_server:cast(self(), {send, AuthPlain});
 
 %% Second stream is started we need bind it.
-parse_xml([#xmlel{name= <<"stream:features">>}], _) ->
+parse_xml([#xmlel{name= <<"stream:features">>}], State) ->
     lager:info("Second stream started!!"),
-    XmlBind = xml_packet(bind, 121324567),
+    XmlBind = xml_packet(bind, State),
     gen_server:cast(self(), {send, XmlBind});
 
-parse_xml([#xmlel{name= <<"success">>}], #state{name=Name, server=Server}) ->
-    XmlPacket = xml_packet(stream, {Name, Server}),
+parse_xml([#xmlel{name= <<"success">>}], State) ->
+    XmlPacket = xml_packet(stream, State),
     %% lager:info("New stream ~p", [XmlPacket]),
     gen_server:cast(self(), {new_stream, XmlPacket});
 
 %% Session is started, we start rooms' workers.
 parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"type">>, <<"result">>}|_]}]=Xml,
-	  #state{rooms=Rooms, name=Name, server=Server}) ->
+	  #state{rooms=Rooms}=State) ->
     lager:info("New sessions started, we are starting rooms ~p!!!", [Rooms]),
     %% Start ping scheduler
-    ping_scheduler(Name, Server),
-    [ begin
-	  Pid ! {get_data, Xml}
-      end || {_Room, Pid} <- Rooms ];
+    ping_scheduler(State),
+    [ Pid ! {get_data, Xml} || {_Room, Pid} <- Rooms ];
 
     
 parse_xml([#xmlel{name= <<"iq">>, attrs=[{<<"from">>, AServer}|_]}],
-	  #state{name = Name, server=Server, tref = TRef}) when AServer =:= Server ->
+	  #state{server=Server, tref=TRef}=State) when AServer =:= Server ->
     lager:info("We got ping from ~p server!!", [Server]),
     %% First we cancel error TRef
     {ok, cancel} = timer:cancel(TRef),
     %% Start ping scheduler again
-    ping_scheduler(Name, Server);
+    ping_scheduler(State);
 
-parse_xml([#xmlel{name= <<"iq">>}], _) ->
-    XmlPacket = xml_packet(session, 123456576),
+parse_xml([#xmlel{name= <<"iq">>}], State) ->
+    XmlPacket = xml_packet(session, State),
     gen_server:cast(self(), {send, XmlPacket});
 
 parse_xml([#xmlel{name= <<"message">>}=Data]=Xml, #state{rooms=Rooms}=_State) ->
@@ -302,37 +299,60 @@ parse_xml([#xmlel{name= <<"message">>}=Data]=Xml, #state{rooms=Rooms}=_State) ->
     end;
 
 parse_xml(Data, _) ->
-    lager:info("RECV XML: ~n~p~n", [Data]).
+    lager:info("RECV UNHANDLED XML: ~n~p~n", [Data]).
 
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%% Parse XML Packets
+%% XML Packets
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
-xml_packet(ping, {Name, Server}) ->
+xml_packet(ping, #state{name=Name, server=Server}=_State) ->
     JID = <<Name/binary, "@", Server/binary, "/erlang">>,
-    <<"<iq from='", JID/binary, "' to='", Server/binary, "' id='c2s1' type='get'><ping xmlns='urn:xmpp:ping'/></iq>">>;
+    xmlel_to_stanza({xmlel, <<"iq">>, 
+		     [{<<"from">>, JID}, {<<"to">>, Server},
+		      {<<"id">>, <<"c2s1">>}, {<<"type">>, <<"get">>}],
+		     [{xmlel, <<"ping">>, [{<<"xmlns">>, <<"urn:xmpp:ping">>}], []}]});
 
-xml_packet(stream, {Name, Server}) ->
+xml_packet(stream, #state{name=Name, server=Server}=_State) ->
     JID = <<Name/binary, "@", Server/binary>>,
-    <<"<stream:stream xmlns='jabber:client' from='", JID/binary, "' to='", Server/binary, "' version='1.0' xmlns:stream='http://etherx.jabber.org/streams' >">>;
+    xmlel_to_stanza({xmlstreamstart, <<"stream:stream">>, 
+		     [{<<"xmlns">>, <<"jabber:client">>}, {<<"from">>, JID}, {<<"to">>, Server},
+		      {<<"version">>, <<"1.0">>}, 
+		      {<<"xmlns:stream">>, <<"http://etherx.jabber.org/streams">>}]});
 
-xml_packet(bind, Id) ->
-    <<"<iq type='set' id='97460001'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>erlang</resource> </bind></iq>">>;
+xml_packet(bind, #state{id=Id}=_State) ->
+    D = xmlel_to_stanza({xmlel, <<"iq">>, [{<<"type">>, <<"set">>}, {<<"id">>, <<"974600002">>}],
+		     [{xmlel, <<"bind">>, [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-bind">>}],
+		       [{xmlel, <<"resource">>, [], [{xmlcdata, <<"erlang">>}]}]}]});
 
-xml_packet(session, Id) ->
-    <<"<iq type='set' id='97460002'><session xmlns='urn:ietf:params:xml:ns:xmpp-session' /></iq>">>.
+%% %% TODO: Add dynamic id
+xml_packet(session, #state{id=Id}=_State) ->
+    xmlel_to_stanza({xmlel, <<"iq">>, 
+		     [{<<"type">>, <<"set">>}, {<<"id">>, <<"974600002">>}],
+		     [{xmlel, <<"session">>,
+		       [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-session">>}], []}]}).
 
 %% xml_packet(close, stream) ->
 %%     <<"</stream:stream>">>;
 
 
-xml_packet(auth, 'PLAIN', {Name, Password}) ->
+xml_packet(auth, 'PLAIN', #state{name=Name, pass=Password}=_State) ->
     lager:info("Name ~p, Password ~p", [Name, Password]),
     BaseData = base64:encode(<<0, Name/binary, 0, Password/binary>>),
-    <<"<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>", BaseData/binary, "</auth>">>.
+    xmlel_to_stanza({xmlel, <<"auth">>, 
+		     [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-sasl">>}, 
+		      {<<"mechanism">>, <<"PLAIN">>}],
+		     [{xmlcdata, BaseData}]}).
 
 
-ping_scheduler(Name, Server) ->
-    XmlPacket = xml_packet(ping, {Name, Server}),
+ping_scheduler(State) ->
+    XmlPacket = xml_packet(ping, State),
     timer:send_after(?TIMER_DELAY, {timer, XmlPacket}).
+
+
+xmlel_to_stanza(Xml) ->
+    list_to_binary(exml:to_list(Xml)).
+
+
+%% TODO: Bot gets this message when smb kicks him
+%% [{xmlel,<<"presence">>,[{<<"from">>,<<".conf@conference.jabber.ru/yebot">>},{<<"to">>,<<"yebot@jabber.ru/erlang">>},{<<"type">>,<<"unavailable">>}],[{xmlel,<<"x">>,[{<<"xmlns">>,<<"http://jabber.org/protocol/muc#user">>}],[{xmlel,<<"item">>,[{<<"affiliation">>,<<"member">>},{<<"role">>,<<"none">>}],[{xmlel,<<"reason">>,[],[{xmlcdata,<<208,191,209,136,208,181,208,187,32,208,189,208,176,209,133>>}]}]},{xmlel,<<"status">>,[{<<"code">>,<<"307">>}],[]}]}]}]
