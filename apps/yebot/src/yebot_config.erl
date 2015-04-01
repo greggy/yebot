@@ -191,6 +191,7 @@ parse_config([{Name, Opts}|TData], Acc) ->
 		server = get_option("server", Opts, <<>>),
 		muc = get_option("muc", Opts, <<>>),
 		pass = get_option("pass", Opts, <<>>),
+		mechanism = get_option("mechanism", Opts, <<"PLAIN">>),
 		rooms = get_option("rooms", Opts, [])
 	       },
     parse_config(TData, [Config|Acc]);

@@ -38,7 +38,7 @@
 	  config_rooms=[] :: list(binary()),
 	  rooms=[] :: list({binary(), pid()}),
 	  xml_stream=undefined,
-	  id :: binary,
+	  mechanism :: binary(),
 	  tref=undefined :: timer:tref()
 }).
 
@@ -48,6 +48,7 @@
 
 -spec get_rooms(Disp :: atom()) -> list() | list(binary()).
 get_rooms(Disp) ->
+
     gen_server:call(Disp, get_rooms).
 
 
@@ -90,6 +91,7 @@ init([Bot]) ->
     {ok, #state{name = Bot#config.name, 
 		server = Bot#config.server,
 		pass = Bot#config.pass,
+		mechanism = Bot#config.mechanism,
 		config_rooms = Bot#config.rooms}}.
 
 %%--------------------------------------------------------------------
@@ -229,6 +231,8 @@ handle_info(_Info, State) ->
                    term()).
 terminate(Reason, #state{socket=Socket}=_State) ->
     lager:info("DISP STOP with reason ~p!!!", [Reason]),
+    XmlPacket = xml_packet(close, stream),
+    gen_server:cast(self(), {send, XmlPacket}),
     ok = gen_tcp:close(Socket),
     ok.
 
@@ -250,11 +254,22 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+parse_xml([#xmlstreamstart{name= <<"stream:stream">>}=Data], State) ->
+    %% Id = exml_query:attr(Data, <<"id">>),
+    %% lager:info("GET SESSION ID ~p", [Id]),
+    State;
+
 %% Stream is started we need authenticated.
-parse_xml([#xmlel{name= <<"stream:features">>, children=[#xmlel{name= <<"starttls">>}|_]}], State) ->
-    lager:info("State ~p", [State]),
-    AuthPlain = xml_packet(auth, 'PLAIN', State),
-    gen_server:cast(self(), {send, AuthPlain});
+parse_xml([#xmlel{name= <<"stream:features">>,
+		  children=[#xmlel{name= <<"starttls">>}|_]}=Xml],
+	  #state{mechanism=Mech}=State) ->
+    lager:info("State ~p, MECH ~p, LIST MECHS ~p", [State, Mech, list_mechanisms(Xml)]),
+    case lists:member(Mech, list_mechanisms(Xml)) of
+	false ->
+	    make_auth(<<"PLAIN">>, State);
+	true ->
+	    make_auth(<<"DIGEST-MD5">>, State)
+    end;
 
 %% Second stream is started we need bind it.
 parse_xml([#xmlel{name= <<"stream:features">>}], State) ->
@@ -288,6 +303,19 @@ parse_xml([#xmlel{name= <<"iq">>}], State) ->
     XmlPacket = xml_packet(session, State),
     gen_server:cast(self(), {send, XmlPacket});
 
+%% DIGEST-MD5 Auth
+parse_xml([#xmlel{name= <<"challenge">>}=Data], State) ->
+    Bin = base64:decode(exml_query:cdata(Data)),
+    Pl = challenge_to_pl(Bin),
+    XmlPacket = 
+	case proplists:get_value(<<"rspauth">>, Pl) of
+	    undefined ->
+		xml_packet(response, Pl, State);
+	    _ ->
+		xml_packet(response, State)
+	end,
+    gen_server:cast(self(), {send, XmlPacket});
+
 parse_xml([#xmlel{name= <<"message">>}=Data]=Xml, #state{rooms=Rooms}=_State) ->
     From = exml_query:attr(Data, <<"from">>),
     [Room|_] = binary:split(From, <<"@">>),
@@ -310,7 +338,7 @@ xml_packet(ping, #state{name=Name, server=Server}=_State) ->
     JID = <<Name/binary, "@", Server/binary, "/erlang">>,
     xmlel_to_stanza({xmlel, <<"iq">>, 
 		     [{<<"from">>, JID}, {<<"to">>, Server},
-		      {<<"id">>, <<"c2s1">>}, {<<"type">>, <<"get">>}],
+		      {<<"id">>, <<"ping_1">>}, {<<"type">>, <<"get">>}],
 		     [{xmlel, <<"ping">>, [{<<"xmlns">>, <<"urn:xmpp:ping">>}], []}]});
 
 xml_packet(stream, #state{name=Name, server=Server}=_State) ->
@@ -320,30 +348,70 @@ xml_packet(stream, #state{name=Name, server=Server}=_State) ->
 		      {<<"version">>, <<"1.0">>}, 
 		      {<<"xmlns:stream">>, <<"http://etherx.jabber.org/streams">>}]});
 
-xml_packet(bind, #state{id=Id}=_State) ->
-    D = xmlel_to_stanza({xmlel, <<"iq">>, [{<<"type">>, <<"set">>}, {<<"id">>, <<"974600002">>}],
+xml_packet(starttls, _State) ->
+    xmlel_to_stanza({xmlel, <<"starttls">>, 
+		     [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-tls">>}], []});
+
+xml_packet(bind, _State) ->
+    xmlel_to_stanza({xmlel, <<"iq">>, [{<<"type">>, <<"set">>}, {<<"id">>, <<"bind_1">>}],
 		     [{xmlel, <<"bind">>, [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-bind">>}],
 		       [{xmlel, <<"resource">>, [], [{xmlcdata, <<"erlang">>}]}]}]});
 
-%% %% TODO: Add dynamic id
-xml_packet(session, #state{id=Id}=_State) ->
+xml_packet(session, _State) ->
     xmlel_to_stanza({xmlel, <<"iq">>, 
-		     [{<<"type">>, <<"set">>}, {<<"id">>, <<"974600002">>}],
+		     [{<<"type">>, <<"set">>}, {<<"id">>, <<"session_1">>}],
 		     [{xmlel, <<"session">>,
-		       [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-session">>}], []}]}).
+		       [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-session">>}], []}]});
 
-%% xml_packet(close, stream) ->
-%%     <<"</stream:stream>">>;
+xml_packet(response, _State) ->
+    xmlel_to_stanza({xmlel, <<"response">>, 
+		     [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-sasl">>}], []});
+
+xml_packet(close, stream) ->
+    xmlel_to_stanza({xmlsteamend, <<"stream:stream">>}).
 
 
-xml_packet(auth, 'PLAIN', #state{name=Name, pass=Password}=_State) ->
+xml_packet(auth, <<"PLAIN">>, #state{name=Name, pass=Password}=_State) ->
     lager:info("Name ~p, Password ~p", [Name, Password]),
     BaseData = base64:encode(<<0, Name/binary, 0, Password/binary>>),
     xmlel_to_stanza({xmlel, <<"auth">>, 
 		     [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-sasl">>}, 
 		      {<<"mechanism">>, <<"PLAIN">>}],
-		     [{xmlcdata, BaseData}]}).
+		     [{xmlcdata, BaseData}]});
 
+xml_packet(auth, <<"DIGEST-MD5">>, _State) ->
+    xmlel_to_stanza({xmlel, <<"auth">>, 
+		     [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-sasl">>}, 
+		      {<<"mechanism">>, <<"DIGEST-MD5">>}], []});
+
+%% http://wiki.xmpp.org/web/SASLandDIGEST-MD5
+xml_packet(response, Data, #state{name=Name, pass=Password, server=Server}=_State) ->
+    lager:info("Data Proplists ~p", [Data]),
+    A = erlang:md5(<<Name/binary, ":", Server/binary, ":", Password/binary>>),
+    Nonce = proplists:get_value(<<"nonce">>, Data),
+    Qop = proplists:get_value(<<"qop">>, Data),
+    Charset = proplists:get_value(<<"charset">>, Data),
+    CNonce = yebot_utils:random_number(),
+    AuthzID = <<Name/binary, "@", Server/binary, "/erlang">>,
+    B = yebot_utils:md5_hex(<<A/binary, ":", Nonce/binary, ":", CNonce/binary, ":", AuthzID/binary>>),
+    C = yebot_utils:md5_hex(<<"AUTHENTICATE:xmpp/", Server/binary>>),
+    D = yebot_utils:md5_hex(<<B/binary, ":", Nonce/binary, ":00000001:", 
+			      CNonce/binary, ":", Qop/binary, ":", C/binary>>),
+    E = pl_to_response([{<<"username">>, Name}, {<<"realm">>, Server}, {<<"nonce">>, Nonce},
+			{<<"cnonce">>, CNonce}, {<<"nc">>, <<"00000001">>}, {<<"qop">>, Qop},
+			{<<"digest-uri">>, <<"xmpp/", Server/binary>>}, {<<"response">>, D},
+			{<<"charset">>, Charset}, {<<"authzid">>, AuthzID}]),
+    lager:info("Response Data ~p", [E]),
+    CData = base64:encode(E),
+    xmlel_to_stanza({xmlel, <<"response">>,
+		     [{<<"xmlns">>, <<"urn:ietf:params:xml:ns:xmpp-sasl">>}],
+		     [{xmlcdata, CData}]}).
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% Utils
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 ping_scheduler(State) ->
     XmlPacket = xml_packet(ping, State),
@@ -352,6 +420,39 @@ ping_scheduler(State) ->
 
 xmlel_to_stanza(Xml) ->
     list_to_binary(exml:to_list(Xml)).
+
+
+list_mechanisms(Xml) ->
+    Mechs = exml_query:subelement(Xml, <<"mechanisms">>),
+    #xmlel{children = Children} = Mechs,
+    lists:foldl(fun(E, A) ->
+			[exml_query:cdata(E)|A]
+		end, [], Children).
+
+
+make_auth(Method, State) ->
+    AuthPacket = xml_packet(auth, Method, State),
+    gen_server:cast(self(), {send, AuthPacket}).   
+
+
+challenge_to_pl(Data) ->
+    lists:foldl(fun(E, A) -> 
+			[K, V] = binary:split(E, <<"=">>),
+			[{K, binary:replace(V, <<"\"">>, <<"">>, [global])}|A]
+		end, [], binary:split(Data, <<",">>, [global])).
+
+
+pl_to_response(Data) ->
+    lager:info("Data ~p", [Data]),
+    lists:foldl(fun({K, V}, A) -> 
+			<<K/binary, "=\"", V/binary, "\",", A/binary>>
+		end, 
+		begin 
+		    {K, V} = hd(Data),
+		    <<K/binary, "=\"", V/binary, "\"">> 
+		end,
+		tl(Data)).
+
 
 
 %% TODO: Bot gets this message when smb kicks him

@@ -7,11 +7,11 @@
 
 
 -record(config, {
-	  socket :: gen_tcp:socket(),
 	  name :: binary(),
 	  server :: binary(),
 	  pass :: binary(),
 	  muc :: binary(),
+	  mechanism :: binary(),
 	  rooms :: list(binary())
 }).
 
